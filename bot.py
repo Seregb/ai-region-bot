@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import feedparser
 from datetime import datetime, timedelta
@@ -14,32 +15,54 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
 # === 1. КЛЮЧЕВЫЕ СЛОВА (БЕЗ "ИИ") ===
+
+# Основные ИИ-ключи. Их наличие сразу указывает на технологическую тематику.
 AI_KEYWORDS = [
     "искусственный интеллект",
     "нейросеть",
-    "нейросети",
     "машинное обучение",
     "чат-бот",
-    "чат бот",
     "ИИ-ассистент",
+    "LLM",
+    "роботизация",
+]
+
+# Ключевые слова, которые сами по себе не гарантируют ИИ-тематику (могут встречаться
+# в новостях про госуслуги, границы, инфраструктуру и т.п.), но усиливают сигнал,
+# если найдены вместе с основными ИИ-ключами или словами контекста.
+AI_CONTEXT_REQUIRED_KEYWORDS = [
     "распознавание лиц",
     "компьютерное зрение",
     "видеоаналитика",
     "биометрия",
-    "цифровизация",
     "умный город",
-    "IoT",
-    "интернет вещей",
-    "нейронн сет",
-    "LLM",
     "голосовой помощник",
     "голосовое управление",
     "телемедицина",
     "электронное правительство",
     "госуслуги",
+    "цифровизация",
     "автоматизация процессов",
-    "роботизация"
 ]
+
+# Ключевые слова, которые НЕ являются самостоятельными ИИ-маркерами, а служат
+# для верификации контекста. Если в тексте найдены ИИ-ключи (AI_KEYWORDS), но
+# ни одно из этих слов — новость, скорее всего, не про ИИ.
+AI_CONTEXT_WORDS = [
+    # Явные ИИ/ML-термины
+    "искусственный интеллект", "нейросет", "машинно обучен", "алгоритм",
+    "deep learn", "neural network", "трансформер", "токен", "модель",
+    # Технологические слова
+    "технолог", "цифров", "автоматизац", "робот", "беспилотн", "дрон",
+    "дата-цент", "серверн", "программ", "интернет вещей", "iot",
+    # Действия с ИИ
+    "внедр", "разрабат", "обуча", "анализир", "распознав", "генерир",
+    "предсказ", "классифик", "обработка данных", "компьютерн зрение",
+]
+
+# Короткие ключи (<=3 символов) проверяются как целые слова (\b), чтобы не
+# совпадать с другими словами: IoT ≠ Patriot, LLM ≠ SmallTalk.
+AI_SHORT_KEYWORDS = {"IoT", "LLM"}
 
 # === 2. РЕГИОНЫ РОССИИ ===
 RUSSIAN_REGIONS = [
@@ -154,14 +177,79 @@ def is_regional_news(title: str, summary: str, url: str) -> Tuple[bool, str]:
     return False, ""
 
 def contains_ai_keywords(text: str) -> Tuple[bool, List[str]]:
+    """
+    Проверяет текст на наличие ИИ-ключевых слов.
+    Короткие ключи (<=3 символов) — IoT, LLM — проверяются как целые слова
+    (граница слова \b), чтобы не совпадать с другими словами:
+      IoT ≠ Patriot, LLM ≠ SmallTalk.
+    Длинные фразы — "искусственный интеллект", "машинное обучение" —
+    проверяются обычным вхождением подстроки.
+    """
     if not text:
         return False, []
-    text_lower = text.lower()
+
     found = []
     for keyword in AI_KEYWORDS:
-        if keyword.lower() in text_lower:
-            found.append(keyword)
+        kw_stripped = keyword.strip().lower()
+
+        if len(kw_stripped) <= 3 and keyword.upper().replace("-", "") == kw_stripped.upper():
+            # Короткая аббревиатура — ищем как целое слово (граница слова)
+            pattern = r'\b' + re.escape(kw_stripped) + r'\b'
+            if re.search(pattern, text, re.IGNORECASE):
+                found.append(keyword)
+        else:
+            # Длинная фраза — обычное вхождение подстроки
+            if kw_stripped in text.lower():
+                found.append(keyword)
+
     return len(found) > 0, found
+
+
+def is_ai_context_valid(title: str, summary: str, found_keywords: List[str]) -> bool:
+    """
+    Проверяет, что найденные ИИ-ключи действительно в технологическом контексте.
+
+    Алгоритм:
+    1. Считаем, сколько слов из AI_CONTEXT_WORDS найдено в тексте.
+    2. Если среди найденных ключей есть короткие (IoT, LLM) — требую >= 2
+       контекстных слов (короткие ключи часто ложноположительные).
+    3. Для длинных фраз ("искусственный интеллект") — достаточно >= 1
+       контекстного слова.
+    4. Если найден AI_CONTEXT_REQUIRED_KEYWORDS ("госуслуги", "биометрия" и т.п.),
+       они считаются как 0.5 контекстных слова каждый (максимум 1).
+
+    Отсекает ложноположительные, где ИИ-ключи встречаются вне технологического
+    контекста: новости про Patriot, госуслуги без связи с ИИ и т.п.
+    """
+    if not found_keywords:
+        return False
+
+    text = title + " " + summary
+    text_lower = text.lower()
+
+    # Считаем найденные контекстные слова
+    context_count = 0
+    for word in AI_CONTEXT_WORDS:
+        if word in text_lower:
+            context_count += 1
+
+    # Проверяем, есть ли среди найденных ключей короткие (IoT, LLM)
+    has_short_keyword = any(k in AI_SHORT_KEYWORDS for k in found_keywords)
+
+    # AI_CONTEXT_REQUIRED_KEYWORDS ("госуслуги", "биометрия" и т.п.) дают
+    # дополнительный бонус, но не больше 1 балла
+    context_required_count = sum(1 for k in AI_CONTEXT_REQUIRED_KEYWORDS if k.lower() in text_lower)
+    context_bonus = min(context_required_count * 0.5, 1)
+
+    total_score = context_count + context_bonus
+
+    if has_short_keyword:
+        # Короткие ключи — повышенная планка (IoT ≠ Patriot)
+        return total_score >= 2
+    else:
+        # Длинные фразы — достаточно минимального контекста
+        return total_score >= 1
+
 
 def fetch_rss_feed(feed_info: Dict) -> List[Dict]:
     try:
@@ -191,7 +279,12 @@ def fetch_rss_feed(feed_info: Dict) -> List[Dict]:
             has_keyword, found_keywords = contains_ai_keywords(text)
             if not has_keyword:
                 continue
-            
+
+            # Проверяем контекст: найденные ключи должны быть в технологическом
+            # окружении. Отсекает ложноположительные (Patriot→IoT, госуслуги без ИИ).
+            if not is_ai_context_valid(entry.title, summary, found_keywords):
+                continue
+
             is_regional, region_name = is_regional_news(entry.title, summary, entry.link)
             if not is_regional:
                 continue
